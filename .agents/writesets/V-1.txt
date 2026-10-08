@@ -1,0 +1,4 @@
+crates/svg/**
+apps/vectorcraft-cli/**
+docs/mcp.md
+README.md
