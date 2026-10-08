@@ -60,7 +60,9 @@ USAGE:
   vectorcraft-cli run [--in FILE] [--cmd ID [--params JSON]]... [--export FILE]... [--scale N]
       Headless batch: open FILE (any readable format) or start a new document, run commands in
       order, export each FILE in the format its extension picks (see Writable formats). Prints one
-      JSON result per step.
+      JSON result per step. A `--params` string of the form \"$N...\" (e.g. \"$1.matches[0].id\")
+      is replaced by that path into the Nth `--cmd` step's result (1-based); \"$$...\" is the
+      escape for a literal leading `$`.
 
   vectorcraft-cli commands
       Print the command catalogue as JSON.
@@ -209,6 +211,70 @@ enum Step {
     Export(String),
 }
 
+/// Is `s` a `--params` step reference (`$N` followed by a `.key` / `[index]` path), rather than a
+/// plain string that happens to start with `$`?
+fn is_step_ref(s: &str) -> bool {
+    let rest = s.strip_prefix('$').unwrap_or_default();
+    let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
+    digits > 0 && matches!(rest.as_bytes().get(digits), Some(b'.' | b'['))
+}
+
+/// `$N<path>` against the 1-based `--cmd` step results so far: `N` picks the step, then `.key` /
+/// `[index]` walks its JSON result (e.g. `$1.matches[0].id`). Named after the reference for error
+/// messages.
+fn resolve_step_ref(s: &str, results: &[Value]) -> Result<Value, String> {
+    let rest = &s[1..];
+    let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let n: usize = rest[..digits].parse().map_err(|_| format!("{s}: bad step number"))?;
+    if n == 0 {
+        return Err(format!("{s}: step 0 doesn't exist (steps are 1-based)"));
+    }
+    let mut cur = results.get(n - 1).ok_or_else(|| format!("{s}: step {n} hasn't run yet (only {} step(s) so far)", results.len()))?;
+    let mut path = &rest[digits..];
+    while !path.is_empty() {
+        if let Some(r) = path.strip_prefix('.') {
+            let end = r.find(['.', '[']).unwrap_or(r.len());
+            let key = &r[..end];
+            cur = cur.get(key).ok_or_else(|| format!("{s}: no `{key}` in step {n}'s result"))?;
+            path = &r[end..];
+        } else if let Some(r) = path.strip_prefix('[') {
+            let end = r.find(']').ok_or_else(|| format!("{s}: `[` with no closing `]`"))?;
+            let idx: usize = r[..end].parse().map_err(|_| format!("{s}: bad index `{}`", &r[..end]))?;
+            cur = cur.get(idx).ok_or_else(|| format!("{s}: no index {idx} in step {n}'s result"))?;
+            path = &r[end + 1..];
+        } else {
+            return Err(format!("{s}: bad reference syntax at `{path}`"));
+        }
+    }
+    Ok(cur.clone())
+}
+
+/// Replace every `--params` string that is a step reference, recursively; `$$` at the start of a
+/// string is the escape for a literal leading `$` (so `"$$1"` becomes the plain string `"$1"`).
+fn resolve_step_refs(params: &mut Value, results: &[Value]) -> Result<(), String> {
+    match params {
+        Value::String(s) => {
+            if let Some(rest) = s.strip_prefix("$$") {
+                *s = format!("${rest}");
+            } else if is_step_ref(s) {
+                *params = resolve_step_ref(s, results)?;
+            }
+        }
+        Value::Array(a) => {
+            for v in a {
+                resolve_step_refs(v, results)?;
+            }
+        }
+        Value::Object(o) => {
+            for v in o.values_mut() {
+                resolve_step_refs(v, results)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let mut input: Option<String> = None;
     let mut steps: Vec<Step> = vec![];
@@ -248,11 +314,14 @@ fn run(args: &[String]) -> Result<(), String> {
     } else if !matches!(steps.first(), Some(Step::Cmd(id, _)) if id == "file.new") {
         h.ensure_document();
     }
+    let mut results: Vec<Value> = vec![];
     for step in steps {
         match step {
-            Step::Cmd(id, params) => {
+            Step::Cmd(id, mut params) => {
+                resolve_step_refs(&mut params, &results).map_err(|e| format!("{id}: {e}"))?;
                 let r = h.call("engine.execute", json!({"command": id, "params": params})).map_err(|e| format!("{id}: {e}"))?;
                 emit(json!({"step": "cmd", "command": id, "result": r}))?;
+                results.push(r);
             }
             Step::Export(path) => {
                 let r = h.call("app.export", json!({"path": path, "scale": scale})).map_err(|e| format!("export {path}: {e}"))?;

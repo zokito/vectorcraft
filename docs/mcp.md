@@ -489,12 +489,25 @@ vectorcraft-cli run --in in.svg \
 vectorcraft-cli run --cmd file.new --params '{"width":800,"height":600}' \
   --cmd shape.star --params '{"cx":400,"cy":300,"radius1":200,"radius2":90}' \
   --export star.vectorcraft
+# A later --cmd's params can reference an earlier --cmd's result ($N is 1-based):
+vectorcraft-cli run --in face.svg \
+  --cmd document.find --params '{"name":"mouth"}' \
+  --cmd paint.setStroke --params '{"ids":["$1.matches[0].id"],"color":"#ff6f00"}' \
+  --export out.svg
 ```
 
 `run` prints one JSON line per step (`open`, `cmd`, `export`) and exits non-zero on the first failure. `--params`
 applies to the `--cmd` just before it. `run` also accepts the host commands `file.open`, `file.save`, `file.export`,
 `file.exportForScreens` and `tool.select`. `run --in`, `convert` and `info` read every format `document.open` reads
 (`vectorcraft-cli --help` lists them).
+
+In `--params`, a JSON string of the form `"$N<path>"` (`N` a 1-based `--cmd` step number, immediately followed by
+`.key` / `[index]` accessors, e.g. `"$1.matches[0].id"`) is replaced by that value out of the Nth `--cmd` step's
+result; the substitution walks arrays too, so `"ids":["$1.matches[0].id","$1.matches[1].id"]` resolves each entry.
+A plain string that starts with `$` but isn't followed by `.`/`[` (e.g. `"$500"`) is left alone; `"$$..."` is the
+escape for a literal leading `$` (`"$$x"` → `"$x"`). A reference to a step that hasn't run yet, or a path the
+result doesn't have, exits non-zero naming the reference. Only `--cmd` steps are indexed; `--export` doesn't count
+and can't be referenced.
 
 ## Transparency and opacity masks
 

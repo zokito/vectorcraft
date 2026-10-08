@@ -102,3 +102,14 @@ fn label_attributes_name_objects() {
     assert_eq!(d.layers[0].name.as_deref(), Some("Background"));
     assert_eq!(names(&d), ["Background", "Sky box", "Sun disc", "Badge", "plain"]);
 }
+
+#[test]
+fn title_child_names_object() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        <rect x="0" y="0" width="10" height="10"><title>mouth</title></rect>
+    </svg>"##;
+    let d = import(svg).unwrap();
+    assert_eq!(names(&d), ["Layer 1", "mouth"]);
+    let s = export(&d, &ExportOptions::default());
+    assert!(s.contains("id=\"mouth\""), "{s}");
+}

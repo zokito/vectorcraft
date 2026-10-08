@@ -57,7 +57,13 @@ pub(crate) fn import(svg: &str, opts: &ImportOptions) -> Result<(Document, Vec<S
         slots,
         patterns: HashMap::new(),
         midpoints: midpoint_stops(&xml),
-        labels: labels(&xml),
+        labels: {
+            let mut labels = labels(&xml);
+            for (id, title) in &found.titles {
+                labels.entry(id.clone()).or_insert_with(|| title.clone());
+            }
+            labels
+        },
         hidden: found.hidden,
         uses: found.uses,
         symbols: HashMap::new(),
@@ -320,6 +326,8 @@ struct Found {
     files: files::Files,
     /// Ids of the shapes whose strokes don't scale ([`vector_effect`]).
     non_scaling: HashSet<String>,
+    /// A direct `<title>` child's trimmed text, by its element's id (made up if it had none).
+    titles: HashMap<String, String>,
     warnings: Vec<String>,
 }
 
@@ -386,11 +394,13 @@ impl Edits {
 /// * undisplayed objects (`display: none`, as Save writes hidden layers) are shown and recorded,
 ///   to come back hidden; one something links to (a `<use>` template) stays as it is;
 /// * shapes with a non-scaling stroke get an id when they have none, recorded ([`vector_effect`]);
+/// * an element with a direct `<title>` child gets an id when it has none, so [`labels`] can name
+///   it from the title's text;
 /// * linked files are read ([`files`]).
 fn prepass<'s>(svg: &'s str, opts: &ImportOptions) -> (Cow<'s, str>, Found) {
     let mut found = Found::default();
     // (`:` for prefixed elements such as `<svg:image>`.)
-    if !["<a", "display", "<use", ":use", "<image", ":image", vector_effect::NON_SCALING].iter().any(|t| svg.contains(t)) {
+    if !["<a", "display", "<use", ":use", "<image", ":image", "<title", vector_effect::NON_SCALING].iter().any(|t| svg.contains(t)) {
         return (svg.into(), found);
     }
     let Ok(xml) = roxmltree::Document::parse_with_options(svg, roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() }) else {
@@ -407,6 +417,15 @@ fn prepass<'s>(svg: &'s str, opts: &ImportOptions) -> (Cow<'s, str>, Found) {
     for u in elements().filter(|n| n.tag_name().name() == "use") {
         if let Some(sym) = href(u).and_then(|h| h.strip_prefix('#')).filter(|s| symbols.contains(s)) {
             found.uses.insert(edits.id(svg, u), sym.to_string());
+        }
+    }
+    if svg.contains("<title") {
+        for n in elements().filter(|n| n.tag_name().name() != "svg") {
+            let Some(title) = n.children().find(|c| c.is_element() && c.tag_name().name() == "title") else { continue };
+            let text = title.text().unwrap_or_default().trim();
+            if !text.is_empty() {
+                found.titles.insert(edits.id(svg, n), text.to_string());
+            }
         }
     }
     let (display, non_scaling) = (svg.contains("display"), svg.contains(vector_effect::NON_SCALING));
@@ -605,11 +624,12 @@ impl Importer {
         self.labels.get(id).map_or(id, String::as_str)
     }
 
-    /// A new object named after element `id` (unless it has none or a made-up one).
+    /// A new object named after element `id` (unless it has none, or it's made up with no label
+    /// to go with it — a made-up id is meaningless as a name on its own).
     fn named(&mut self, id: &str, kind: NodeKind) -> Node {
         let nid = self.doc.alloc_id();
         let mut n = Node::new(nid, kind);
-        if !id.is_empty() && !made_up(id) {
+        if !id.is_empty() && (!made_up(id) || self.labels.contains_key(id)) {
             n.name = Some(self.name_of(id).to_string());
         }
         n

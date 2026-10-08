@@ -59,6 +59,64 @@ fn run_reports_errors() {
     assert!(!out.status.success());
 }
 
+/// A `--params` string referencing an earlier `--cmd` step's result is resolved before the
+/// command runs, including element-wise inside an array.
+#[test]
+fn run_step_references() {
+    let svg = tmp("ref.svg");
+    std::fs::write(&svg, r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><path id="mouth" d="M10 10 L20 10 L20 20 Z"/></svg>"#)
+        .unwrap();
+    let out = Command::new(BIN)
+        .args(["run", "--in", svg.to_str().unwrap()])
+        .args(["--cmd", "document.find", "--params", r#"{"name":"mouth"}"#])
+        .args([
+            "--cmd",
+            "path.setAnchors",
+            "--params",
+            r#"{"id":"$1.matches[0].id","subpaths":[{"anchors":[{"x":0,"y":0},{"x":30,"y":0},{"x":30,"y":30}],"closed":true}]}"#,
+        ])
+        .args(["--cmd", "document.node", "--params", r#"{"id":"$1.matches[0].id","summary":true}"#])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<Value> = String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[1]["result"]["matches"][0]["name"], "mouth");
+    // The path changed: path.setAnchors ran against the id document.find resolved, and the
+    // node's bounds (read back in the 3rd --cmd step, by the same reference) match the new
+    // anchors rather than the original "M10 10 L20 10 L20 20 Z".
+    assert_eq!(lines[3]["result"]["bounds"], json!({"x": 0.0, "y": 0.0, "width": 30.0, "height": 30.0}), "{lines:?}");
+}
+
+/// A reference to a step that hasn't run (yet, or at all) exits non-zero naming the reference.
+#[test]
+fn run_step_reference_missing() {
+    let out = Command::new(BIN)
+        .args(["run", "--cmd", "file.new"])
+        .args(["--cmd", "path.setAnchors", "--params", r#"{"id":"$5.matches[0].id","subpaths":[]}"#])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("$5.matches[0].id"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `"$$..."` is the escape for a literal leading `$`: it must survive, unresolved, into the
+/// command (here as an object name later found back by that literal name).
+#[test]
+fn run_step_reference_escape() {
+    let out = Command::new(BIN)
+        .args(["run", "--cmd", "file.new"])
+        .args(["--cmd", "shape.rectangle", "--params", r#"{"x":0,"y":0,"width":10,"height":10}"#])
+        .args(["--cmd", "object.setProps", "--params", r#"{"ids":["$2.id"],"name":"$$x"}"#])
+        .args(["--cmd", "document.find", "--params", r#"{"name":"$x"}"#])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<Value> = String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[3]["result"]["matches"][0]["name"], "$x", "{lines:?}");
+}
+
 #[test]
 fn mcp_headless_over_stdio() {
     let mut child = Command::new(BIN).args(["mcp", "--headless"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
