@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use vectorcraft_color::{BlendMode, Color, Paint};
-use vectorcraft_doc::{Appearance, Document, Effect, Node, NodeKind};
+use vectorcraft_doc::{Appearance, Document, Effect, LiveShape, Node, NodeKind};
 use vectorcraft_effects::RasterFx;
 use vectorcraft_geom::{Point, Rect, shapes};
 use vectorcraft_svg::{ExportOptions, export, import, import_with_report};
@@ -218,6 +218,44 @@ fn exported_effects_import_as_the_same_effects() {
         let got = vectorcraft_effects::raster_effects(&art(&back)[0].appearance.effects);
         assert_eq!(got, vectorcraft_effects::raster_effects(&effects), "{effects:?}");
     }
+}
+
+#[test]
+fn rect_imports_as_live_rectangle() {
+    let (d, w) = open(r##"<rect id="head" x="10" y="20" width="80" height="40" rx="8"/>"##);
+    assert!(w.is_empty(), "{w:?}");
+    let a = art(&d);
+    assert_eq!(a.len(), 1, "{a:?}");
+    let NodeKind::Path { live: Some(LiveShape::Rectangle { w: rw, h: rh, radii, xf, .. }), .. } = &a[0].kind else {
+        panic!("not a live rectangle: {:?}", a[0].kind)
+    };
+    assert_eq!((*rw, *rh, *radii), (80.0, 40.0, [8.0; 4]));
+    let [sx, ky, kx, sy, tx, ty] = xf.as_coeffs();
+    assert_eq!((sx, ky, kx, sy, tx, ty), (1.0, 0.0, 0.0, 1.0, 10.0, 20.0));
+    assert_similar(&render_artboard(&d), &resvg_render(&svg(r##"<rect x="10" y="20" width="80" height="40" rx="8"/>"##), 200, 120), 24.0, 0.003);
+}
+
+#[test]
+fn circle_and_ellipse_import_as_live_ellipse() {
+    let (d, w) = open(r##"<circle id="eye_left" cx="30" cy="20" r="10"/><ellipse id="body" cx="100" cy="50" rx="40" ry="25"/>"##);
+    assert!(w.is_empty(), "{w:?}");
+    let a = art(&d);
+    assert_eq!(a.len(), 2, "{a:?}");
+    for (n, (cx, cy, want_w, want_h)) in a.iter().zip([(30.0, 20.0, 20.0, 20.0), (100.0, 50.0, 80.0, 50.0)]) {
+        let NodeKind::Path { live: Some(LiveShape::Ellipse { w, h, xf, .. }), .. } = &n.kind else { panic!("not a live ellipse: {:?}", n.kind) };
+        assert_eq!((*w, *h), (want_w, want_h), "{:?}", n.kind);
+        let center = *xf * Point::new(*w / 2.0, *h / 2.0);
+        assert!(center.distance(Point::new(cx, cy)) < 1e-6, "{center:?} vs ({cx}, {cy})");
+    }
+}
+
+#[test]
+fn skewed_rect_stays_plain_path() {
+    let (d, w) = open(r##"<rect id="r" x="10" y="10" width="60" height="30" rx="5" transform="skewX(20)"/>"##);
+    assert!(w.is_empty(), "{w:?}");
+    let a = art(&d);
+    assert_eq!(a.len(), 1, "{a:?}");
+    assert!(matches!(a[0].kind, NodeKind::Path { live: None, .. }), "{:?}", a[0].kind);
 }
 
 #[test]

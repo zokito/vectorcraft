@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use vectorcraft_color::{Color, Gradient, GradientPaint, Paint};
-use vectorcraft_doc::{Appearance, Document, Node};
+use vectorcraft_doc::{Appearance, Document, LiveShape, Node, NodeKind};
 use vectorcraft_geom::{Rect, shapes};
 use vectorcraft_svg::{ExportOptions, ObjectIds, Styling, export, import};
 
@@ -101,6 +101,22 @@ fn label_attributes_name_objects() {
     let d = import(svg).unwrap();
     assert_eq!(d.layers[0].name.as_deref(), Some("Background"));
     assert_eq!(names(&d), ["Background", "Sky box", "Sun disc", "Badge", "plain"]);
+}
+
+#[test]
+fn unnamed_rect_stays_unnamed() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        <rect x="10" y="10" width="40" height="20" rx="4"/>
+    </svg>"##;
+    let d = import(svg).unwrap();
+    assert_eq!(names(&d), ["Layer 1"]);
+    let mut live = None;
+    d.walk(|n| {
+        if let NodeKind::Path { live: l, .. } = &n.kind {
+            live = l.clone();
+        }
+    });
+    assert!(matches!(live, Some(LiveShape::Rectangle { .. })), "{live:?}");
 }
 
 #[test]

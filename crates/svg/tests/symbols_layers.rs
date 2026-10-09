@@ -222,7 +222,7 @@ fn clipped_layers_come_in_as_clipping_layers() {
     let d = import(CLIPPED_LAYERS).unwrap();
     assert_eq!(
         layer_art(&d),
-        [("Cut lines".to_string(), true, vec!["Path", "Path"]), ("HATCH".to_string(), true, vec!["Path", "Path"])],
+        [("Cut lines".to_string(), true, vec!["Path", "Rectangle"]), ("HATCH".to_string(), true, vec!["Path", "Rectangle"])],
         "{:?}",
         d.layers
     );
@@ -254,7 +254,20 @@ fn clipping_layers_round_trip() {
     d.layers.push(n.layers[0].clone());
     let svg = export(&d, &ExportOptions::default());
     let back = import(&svg).unwrap();
-    assert_eq!(layer_art(&back), layer_art(&d), "{svg}");
+    // Export writes live shapes as plain `<path>`: re-import can't tell they were live without a
+    // `<rect>`/`<ellipse>` tag, so their kind label falls back to "Path".
+    let flatten = |v: Vec<(String, bool, Vec<&'static str>)>| -> Vec<(String, bool, Vec<&'static str>)> {
+        v.into_iter()
+            .map(|(name, clips, kinds)| {
+                (
+                    name,
+                    clips,
+                    kinds.into_iter().map(|k| if matches!(k, "Rectangle" | "Rounded Rectangle" | "Ellipse") { "Path" } else { k }).collect(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(flatten(layer_art(&back)), flatten(layer_art(&d)), "{svg}");
     assert_similar(&render_artboard(&back), &render_artboard(&d), 24.0, 0.002);
 }
 
@@ -273,7 +286,7 @@ fn text_joining_a_clipping_layer_stays_unclipped() {
     );
     for l in &d.layers {
         let g = l.children().unwrap().iter().find(|c| c.clips()).unwrap();
-        assert_eq!(g.children().unwrap().iter().map(|c| c.kind_label()).collect::<Vec<_>>(), ["Path", "Path"]);
+        assert_eq!(g.children().unwrap().iter().map(|c| c.kind_label()).collect::<Vec<_>>(), ["Path", "Rectangle"]);
     }
 }
 
