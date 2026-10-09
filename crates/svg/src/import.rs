@@ -8,8 +8,8 @@ use std::sync::Arc;
 use usvg::roxmltree;
 use vectorcraft_color::{BlendMode, Color, Gradient, GradientGeom, GradientKind, GradientPaint, GradientStop, Paint};
 use vectorcraft_doc::{
-    Appearance, AppearanceItem, Dash, Document, FillLayer, ImageBlob, ImageObject, LayerColor, LineCap, LineJoin, Node, NodeKind, PatternDef,
-    StrokeLayer, Unit,
+    Appearance, AppearanceItem, Dash, Document, FillLayer, ImageBlob, ImageObject, LayerColor, LineCap, LineJoin, LiveShape, Node, NodeKind,
+    PatternDef, StrokeLayer, Unit,
 };
 use vectorcraft_geom::{Affine, BezPath, FillRule, PathData, Point, Rect, Vec2, shapes};
 
@@ -71,6 +71,7 @@ pub(crate) fn import(svg: &str, opts: &ImportOptions) -> Result<(Document, Vec<S
         files,
         non_scaling: found.non_scaling,
         screen: (kx * ky).sqrt(),
+        shapes: found.shapes,
     };
     if im.files.nested_text() {
         im.warn("text inside an SVG image isn't imported".into());
@@ -219,6 +220,9 @@ struct Importer {
     /// Points per screen pixel (the root's user unit before its `viewBox`): what a non-scaling
     /// stroke's width is measured in.
     screen: f64,
+    /// Raw `<rect>`/`<circle>`/`<ellipse>` dimensions usvg turns into plain paths, by element id
+    /// (made up when they had none, see [`primitive_shapes`]): what a live shape must match.
+    shapes: HashMap<String, RawShape>,
 }
 
 /// A `<symbol>` made a symbol: its name, its art with no object ids (what each `<use>` has to show
@@ -328,7 +332,62 @@ struct Found {
     non_scaling: HashSet<String>,
     /// A direct `<title>` child's trimmed text, by its element's id (made up if it had none).
     titles: HashMap<String, String>,
+    /// Raw `<rect>`/`<circle>`/`<ellipse>` dimensions, by id (made up if it had none, see
+    /// [`primitive_shapes`]).
+    shapes: HashMap<String, RawShape>,
     warnings: Vec<String>,
+}
+
+/// A `<rect>`, `<circle>` or `<ellipse>` element's raw dimensions, read from the XML before usvg
+/// turns it into a plain path ([`primitive_shapes`]): the shape [`live_shape`] tries to match the
+/// resulting path against.
+#[derive(Clone, Copy)]
+enum RawShape {
+    /// `w`/`h` and a single circular corner radius (`<rect>`'s `rx`/`ry`, when equal).
+    Rect { w: f64, h: f64, r: f64 },
+    /// `w`/`h` of the ellipse's bounding box (`<circle>`'s `r` doubled, or `<ellipse>`'s `rx`/`ry`
+    /// doubled).
+    Ellipse { w: f64, h: f64 },
+}
+
+/// `<rect>`/`<circle>`/`<ellipse>` elements' raw dimensions, by id (made up via [`Edits::id`] when
+/// they had none, so [`Importer::path`] can look them up by the id usvg keeps on the path it
+/// turns them into). A `<rect>` with different `rx`/`ry` (elliptical corners) is skipped: it can't
+/// become a live rectangle (circular corners only).
+fn primitive_shapes(svg: &str, xml: &roxmltree::Document, edits: &mut Edits) -> HashMap<String, RawShape> {
+    let num = |n: XNode, name: &str| n.attribute(name).and_then(|v| v.trim().parse::<f64>().ok());
+    let mut out = HashMap::new();
+    for n in xml.descendants().filter(XNode::is_element) {
+        let shape = match n.tag_name().name() {
+            "rect" => {
+                let (Some(w), Some(h)) = (num(n, "width"), num(n, "height")) else { continue };
+                if !(w > 0.0 && h > 0.0) {
+                    continue;
+                }
+                let (rx, ry) = (num(n, "rx"), num(n, "ry"));
+                if let (Some(rx), Some(ry)) = (rx, ry)
+                    && (rx - ry).abs() > 1e-9
+                {
+                    continue;
+                }
+                RawShape::Rect { w, h, r: rx.or(ry).unwrap_or(0.0).max(0.0) }
+            }
+            "circle" => match num(n, "r") {
+                Some(r) if r > 0.0 => RawShape::Ellipse { w: r * 2.0, h: r * 2.0 },
+                _ => continue,
+            },
+            "ellipse" => {
+                let (Some(rx), Some(ry)) = (num(n, "rx"), num(n, "ry")) else { continue };
+                if !(rx > 0.0 && ry > 0.0) {
+                    continue;
+                }
+                RawShape::Ellipse { w: rx * 2.0, h: ry * 2.0 }
+            }
+            _ => continue,
+        };
+        out.insert(edits.id(svg, n), shape);
+    }
+    out
 }
 
 /// Changes to the SVG text: `(range, replacement)`, an empty range inserting.
@@ -400,7 +459,9 @@ impl Edits {
 fn prepass<'s>(svg: &'s str, opts: &ImportOptions) -> (Cow<'s, str>, Found) {
     let mut found = Found::default();
     // (`:` for prefixed elements such as `<svg:image>`.)
-    if !["<a", "display", "<use", ":use", "<image", ":image", "<title", vector_effect::NON_SCALING].iter().any(|t| svg.contains(t)) {
+    const TRIGGERS: &[&str] =
+        &["<a", "display", "<use", ":use", "<image", ":image", "<title", vector_effect::NON_SCALING, "<rect", "<circle", "<ellipse"];
+    if !TRIGGERS.iter().any(|t| svg.contains(t)) {
         return (svg.into(), found);
     }
     let Ok(xml) = roxmltree::Document::parse_with_options(svg, roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() }) else {
@@ -439,6 +500,7 @@ fn prepass<'s>(svg: &'s str, opts: &ImportOptions) -> (Cow<'s, str>, Found) {
         }
     }
     found.files = files::Files::read(svg, &xml, opts, &mut edits, &mut found.warnings);
+    found.shapes = primitive_shapes(svg, &xml, &mut edits);
     (edits.apply(svg), found)
 }
 
@@ -587,6 +649,81 @@ fn rule(r: usvg::FillRule) -> FillRule {
         usvg::FillRule::NonZero => FillRule::NonZero,
         usvg::FillRule::EvenOdd => FillRule::EvenOdd,
     }
+}
+
+/// `raw`'s live shape, when `path` (as usvg converted the element) is exactly `raw`'s canonical
+/// shape under a similarity transform (uniform scale, rotation, translation; no skew):
+/// [`LiveShape::to_path`] of the result must equal `path`, within a tolerance relative to the
+/// shape's own size (usvg's path data is `f32`, see [`fit_similarity`]).
+fn live_shape(raw: &RawShape, path: &PathData) -> Option<LiveShape> {
+    let (candidate, size) = match *raw {
+        RawShape::Rect { w, h, r } => (shapes::rectangle_with_corners(Rect::new(0.0, 0.0, w, h), [r; 4], Default::default()), w + h),
+        RawShape::Ellipse { w, h } => (shapes::ellipse(Rect::new(0.0, 0.0, w, h)), w + h),
+    };
+    let xf = fit_similarity(&candidate, path, 1e-6 * size.max(1e-9))?;
+    Some(match *raw {
+        RawShape::Rect { w, h, r } => LiveShape::Rectangle { w, h, radii: [r; 4], kinds: Default::default(), xf },
+        RawShape::Ellipse { w, h } => LiveShape::Ellipse { w, h, pie: (0.0, 360.0), xf },
+    })
+}
+
+/// The affine mapping `candidate`'s single closed subpath onto `actual`'s (any rotation of its
+/// start anchor), when every anchor matches within `eps` and the affine is a similarity: its
+/// linear part's columns are orthogonal and of equal length (no skew, no non-uniform scale).
+/// `None` when the shapes don't match at all, or only under a transform that isn't a similarity.
+fn fit_similarity(candidate: &PathData, actual: &PathData, eps: f64) -> Option<Affine> {
+    let xf = fit_xf(candidate, actual, eps)?;
+    let [a, b, c, d, _, _] = xf.as_coeffs();
+    let (sx2, sy2) = (a * a + b * b, c * c + d * d);
+    if sx2 <= 1e-24 || sy2 <= 1e-24 {
+        return None;
+    }
+    let ortho = (a * c + b * d).abs() <= 1e-9 * (sx2 * sy2).sqrt();
+    let uniform = (sx2 - sy2).abs() <= 1e-9 * sx2.max(sy2);
+    (ortho && uniform).then_some(xf)
+}
+
+/// The affine mapping `candidate`'s single closed subpath onto `actual`'s, trying every cyclic
+/// rotation of `actual`'s anchor list as a possible start (shape generators don't all agree on
+/// where a closed shape starts). `None` when the subpath counts, anchor counts or closedness
+/// differ, or no rotation fits every anchor within `eps`.
+fn fit_xf(candidate: &PathData, actual: &PathData, eps: f64) -> Option<Affine> {
+    let [c] = candidate.subpaths.as_slice() else { return None };
+    let [a] = actual.subpaths.as_slice() else { return None };
+    if !c.closed || !a.closed || c.anchors.len() != a.anchors.len() || c.anchors.len() < 3 {
+        return None;
+    }
+    let n = c.anchors.len();
+    let close = |p: Point, q: Point| (p - q).hypot() <= eps;
+    (0..n).find_map(|shift| {
+        let idx = |i: usize| (i + shift) % n;
+        let xf =
+            affine_from_3_points([c.anchors[0].p, c.anchors[1].p, c.anchors[2].p], [a.anchors[idx(0)].p, a.anchors[idx(1)].p, a.anchors[idx(2)].p])?;
+        (0..n)
+            .all(|i| {
+                let (ca, aa) = (&c.anchors[i], &a.anchors[idx(i)]);
+                close(xf * ca.p, aa.p) && close(xf * ca.h_in, aa.h_in) && close(xf * ca.h_out, aa.h_out)
+            })
+            .then_some(xf)
+    })
+}
+
+/// The affine mapping `local[i]` to `actual[i]` for every `i`. `None` when `local`'s three points
+/// are collinear (no unique affine maps them).
+fn affine_from_3_points(local: [Point; 3], actual: [Point; 3]) -> Option<Affine> {
+    let (v1, v2) = (local[1] - local[0], local[2] - local[0]);
+    let det = v1.x * v2.y - v2.x * v1.y;
+    if det.abs() <= 1e-12 {
+        return None;
+    }
+    let (w1, w2) = (actual[1] - actual[0], actual[2] - actual[0]);
+    let a = (w1.x * v2.y - w2.x * v1.y) / det;
+    let c = (w2.x * v1.x - w1.x * v2.x) / det;
+    let b = (w1.y * v2.y - w2.y * v1.y) / det;
+    let d = (w2.y * v1.x - w1.y * v2.x) / det;
+    let e = actual[0].x - (a * local[0].x + c * local[0].y);
+    let f = actual[0].y - (b * local[0].x + d * local[0].y);
+    Some(Affine::new([a, b, c, d, e, f]))
 }
 
 impl Importer {
@@ -1089,7 +1226,8 @@ impl Importer {
                 .collect();
             self.named(p.id(), NodeKind::Compound { children, rule: r })
         } else {
-            self.named(p.id(), NodeKind::Path { path, rule: r, live: None, clipping: false, guide: false })
+            let live = self.shapes.get(p.id()).and_then(|raw| live_shape(raw, &path));
+            self.named(p.id(), NodeKind::Path { path, rule: r, live, clipping: false, guide: false })
         };
         n.appearance = appearance;
         Some(n)
@@ -1134,9 +1272,10 @@ impl Importer {
             std::mem::take(&mut self.uses),
             std::mem::take(&mut self.labels),
             std::mem::take(&mut self.non_scaling),
+            std::mem::take(&mut self.shapes),
         );
         let art = self.group_node(tree.root(), acc);
-        (self.links, self.hidden, self.uses, self.labels, self.non_scaling) = outer;
+        (self.links, self.hidden, self.uses, self.labels, self.non_scaling, self.shapes) = outer;
         art
     }
 }
